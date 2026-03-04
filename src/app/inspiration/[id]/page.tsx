@@ -97,6 +97,7 @@ export default function InspirationDetailPage() {
 
   // File upload
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -162,25 +163,104 @@ export default function InspirationDetailPage() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // Reset the input so the same file can be re-selected after an error
+    e.target.value = "";
+
     setUploading(true);
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("inspirationId", id);
+    setUploadError(null);
 
-    if (file.type.startsWith("video/")) {
-      try {
-        const thumbBlob = await generateVideoThumbnail(file);
-        if (thumbBlob) {
-          fd.append("thumbnail", thumbBlob, "thumb.jpg");
-        }
-      } catch (e) {
-        console.error("Thumbnail generation failed:", e);
+    try {
+      // Step 1: Get a presigned PUT URL from our API
+      const presignRes = await fetch("/api/assets/presign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          inspirationId: id,
+          mimeType: file.type,
+          filename: file.name,
+        }),
+      });
+
+      if (!presignRes.ok) {
+        const err = await presignRes.json();
+        throw new Error(err.error || "Failed to get upload URL");
       }
-    }
 
-    await fetch("/api/assets/upload", { method: "POST", body: fd });
-    setUploading(false);
-    fetchData();
+      const { assetId, r2Key, uploadUrl, assetType } = await presignRes.json();
+
+      // Step 2: Upload the file via the Edge proxy (no body size limit)
+      const proxyUrl = `/api/assets/upload-edge?url=${encodeURIComponent(uploadUrl)}`;
+      const uploadRes = await fetch(proxyUrl, {
+        method: "POST",
+        headers: { "Content-Type": file.type },
+        body: file,
+      });
+
+      if (!uploadRes.ok) {
+        const err = await uploadRes.json();
+        throw new Error(err.error || `Upload failed with status ${uploadRes.status}`);
+      }
+
+      // Step 3: Generate and upload thumbnail for videos
+      let thumbnailR2Key: string | null = null;
+      if (file.type.startsWith("video/")) {
+        try {
+          const thumbBlob = await generateVideoThumbnail(file);
+          if (thumbBlob) {
+            // Get presigned URL for thumbnail
+            const thumbPresignRes = await fetch("/api/assets/presign-thumb", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ inspirationId: id, assetId }),
+            });
+            if (thumbPresignRes.ok) {
+              const { thumbnailR2Key: tKey, uploadUrl: tUrl } = await thumbPresignRes.json();
+              const thumbUploadRes = await fetch(
+                `/api/assets/upload-edge?url=${encodeURIComponent(tUrl)}`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "image/jpeg" },
+                  body: thumbBlob,
+                }
+              );
+              if (thumbUploadRes.ok) {
+                thumbnailR2Key = tKey;
+              }
+            }
+          }
+        } catch (thumbErr) {
+          console.error("Thumbnail generation failed:", thumbErr);
+          // Non-fatal: continue without thumbnail
+        }
+      }
+
+      // Step 4: Register the asset in the database
+      const registerRes = await fetch("/api/assets/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assetId,
+          inspirationId: id,
+          r2Key,
+          thumbnailR2Key,
+          mimeType: file.type,
+          assetType,
+          fileSizeBytes: file.size,
+        }),
+      });
+
+      if (!registerRes.ok) {
+        const err = await registerRes.json();
+        throw new Error(err.error || "Failed to register asset");
+      }
+
+      fetchData();
+    } catch (err: any) {
+      console.error("Upload error:", err);
+      setUploadError(err.message || "Upload failed. Please try again.");
+    } finally {
+      setUploading(false);
+    }
   };
 
   const getCurrentTimestamp = (): number | null => {
@@ -397,10 +477,15 @@ export default function InspirationDetailPage() {
                 )}
               </div>
             )}
-            {!assetUrl && (
+            {!assetUrl && !uploading && (
               <div className="flex aspect-video items-center justify-center text-zinc-600">
                 <div className="text-center">
                   <p className="mb-2">No asset uploaded</p>
+                  {uploadError && (
+                    <p className="mb-3 rounded border border-red-800 bg-red-900/30 px-3 py-2 text-xs text-red-400">
+                      {uploadError}
+                    </p>
+                  )}
                   <label className="cursor-pointer rounded bg-zinc-800 px-3 py-1.5 text-sm text-zinc-300 transition hover:bg-zinc-700">
                     Upload Asset
                     <input
@@ -410,12 +495,19 @@ export default function InspirationDetailPage() {
                       onChange={handleFileUpload}
                     />
                   </label>
+                  <p className="mt-2 text-xs text-zinc-600">MP4, WebM, MOV, JPG, PNG, WebP</p>
                 </div>
               </div>
             )}
             {uploading && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/50">
-                <span className="text-white">Uploading...</span>
+              <div className="flex aspect-video items-center justify-center bg-zinc-900">
+                <div className="text-center">
+                  <div className="mb-3 h-1.5 w-48 overflow-hidden rounded-full bg-zinc-800">
+                    <div className="h-full animate-pulse rounded-full bg-white/60" style={{ width: "60%" }} />
+                  </div>
+                  <span className="text-sm text-zinc-400">Uploading to storage...</span>
+                  <p className="mt-1 text-xs text-zinc-600">Large files may take a moment</p>
+                </div>
               </div>
             )}
           </div>

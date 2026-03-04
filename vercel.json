@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "src/app/api/assets/upload/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/annotations/route.ts": {
+      "maxDuration": 30
+    }
+  }
+}
