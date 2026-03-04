@@ -7,39 +7,49 @@ const ALLOWED_VIDEO = ["video/webm", "video/mp4", "video/quicktime"];
 const ALLOWED_IMAGE = ["image/jpeg", "image/png", "image/webp"];
 
 export async function POST(req: NextRequest) {
-  const user = await getOrCreateUser();
-  if (!user) return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+  try {
+    const user = await getOrCreateUser();
+    if (!user) {
+      return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+    }
 
-  const body = await req.json();
-  const { inspirationId, mimeType, filename } = body;
+    const body = await req.json();
+    const { inspirationId, mimeType, filename } = body;
 
-  if (!inspirationId || !mimeType) {
+    if (!inspirationId || !mimeType) {
+      return NextResponse.json(
+        { error: "inspirationId and mimeType are required" },
+        { status: 400 }
+      );
+    }
+
+    const isVideo = ALLOWED_VIDEO.includes(mimeType);
+    const isImage = ALLOWED_IMAGE.includes(mimeType);
+
+    if (!isVideo && !isImage) {
+      return NextResponse.json(
+        { error: "Unsupported file type: " + mimeType },
+        { status: 400 }
+      );
+    }
+
+    const assetId = uuidv4();
+    const ext = (filename || "").split(".").pop() || (isVideo ? "mp4" : "jpg");
+    const r2Key = `inspirations/${inspirationId}/${assetId}.${ext}`;
+
+    const uploadUrl = await getSignedUploadUrl(r2Key, mimeType, 3600);
+
+    return NextResponse.json({
+      assetId,
+      r2Key,
+      uploadUrl,
+      assetType: isVideo ? "video" : "image",
+    });
+  } catch (error: any) {
+    console.error("Presign error:", error);
     return NextResponse.json(
-      { error: "inspirationId and mimeType are required" },
-      { status: 400 }
+      { error: "Internal server error: " + (error.message || "Unknown error") },
+      { status: 500 }
     );
   }
-
-  const isVideo = ALLOWED_VIDEO.includes(mimeType);
-  const isImage = ALLOWED_IMAGE.includes(mimeType);
-
-  if (!isVideo && !isImage) {
-    return NextResponse.json(
-      { error: "Unsupported file type" },
-      { status: 400 }
-    );
-  }
-
-  const assetId = uuidv4();
-  const ext = (filename || "").split(".").pop() || (isVideo ? "mp4" : "jpg");
-  const r2Key = `inspirations/${inspirationId}/${assetId}.${ext}`;
-
-  const uploadUrl = await getSignedUploadUrl(r2Key, mimeType, 3600);
-
-  return NextResponse.json({
-    assetId,
-    r2Key,
-    uploadUrl,
-    assetType: isVideo ? "video" : "image",
-  });
 }

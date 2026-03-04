@@ -190,6 +190,8 @@ export default function InspirationDetailPage() {
     setUploadError(null);
 
     try {
+      console.log("Starting upload for file:", file.name, file.type, file.size);
+      
       // Step 1: Get presigned URL from API
       const presignRes = await fetch("/api/assets/presign", {
         method: "POST",
@@ -199,28 +201,42 @@ export default function InspirationDetailPage() {
           mimeType: file.type,
           filename: file.name,
         }),
+      }).catch(err => {
+        console.error("Fetch error for presign:", err);
+        throw new Error(`Failed to reach presign API: ${err.message}`);
       });
 
       if (!presignRes.ok) {
-        const err = await presignRes.json().catch(() => ({}));
-        throw new Error(err.error || `Failed to get upload URL: ${presignRes.status}`);
+        const contentType = presignRes.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+          const err = await presignRes.json();
+          throw new Error(err.error || `Failed to get upload URL: ${presignRes.status}`);
+        } else {
+          const text = await presignRes.text();
+          throw new Error(`Server error (${presignRes.status}): ${text.substring(0, 100)}`);
+        }
       }
 
       const { assetId, r2Key, uploadUrl, assetType } = await presignRes.json();
+      console.log("Got presigned URL, starting R2 upload...");
 
       // Step 2: Upload file directly to R2 via presigned URL
       const uploadRes = await fetch(uploadUrl, {
         method: "PUT",
         headers: { "Content-Type": file.type },
         body: file,
+      }).catch(err => {
+        console.error("Fetch error for R2 upload:", err);
+        throw new Error(`Failed to reach R2 storage: ${err.message}. Check CORS settings.`);
       });
 
       if (!uploadRes.ok) {
         const errorText = await uploadRes.text().catch(() => "Unknown error");
         throw new Error(
-          `R2 upload failed: ${uploadRes.status} ${errorText.substring(0, 100)}`
+          `R2 storage rejected upload: ${uploadRes.status} ${errorText.substring(0, 100)}`
         );
       }
+      console.log("R2 upload successful.");
 
       // Step 3: Generate and upload thumbnail for videos
       let thumbnailR2Key: string | null = null;
