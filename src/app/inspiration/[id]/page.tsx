@@ -77,6 +77,7 @@ export default function InspirationDetailPage() {
 
   const [showBriefModal, setShowBriefModal] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [annotationAudioUrls, setAnnotationAudioUrls] = useState<
     Record<string, string>
@@ -181,64 +182,216 @@ export default function InspirationDetailPage() {
     });
   };
 
+  // Upload a single chunk via XMLHttpRequest with progress tracking
+  const uploadChunkWithProgress = (
+    url: string,
+    chunk: Blob,
+    onProgress: (loaded: number) => void
+  ): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", url, true);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          onProgress(e.loaded);
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const etag = xhr.getResponseHeader("ETag") || "";
+          resolve(etag);
+        } else {
+          reject(new Error(`Chunk upload failed: ${xhr.status}`));
+        }
+      };
+
+      xhr.onerror = () => reject(new Error("Network error during chunk upload"));
+      xhr.ontimeout = () => reject(new Error("Chunk upload timed out"));
+      xhr.timeout = 300000; // 5 minutes per chunk
+
+      xhr.send(chunk);
+    });
+  };
+
+  // Retry wrapper for chunk uploads
+  const uploadChunkWithRetry = async (
+    url: string,
+    chunk: Blob,
+    onProgress: (loaded: number) => void,
+    maxRetries = 3
+  ): Promise<string> => {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await uploadChunkWithProgress(url, chunk, onProgress);
+      } catch (err) {
+        if (attempt === maxRetries - 1) throw err;
+        console.warn(`Chunk upload attempt ${attempt + 1} failed, retrying...`);
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
+    throw new Error("Chunk upload failed after retries");
+  };
+
+  const MULTIPART_THRESHOLD = 20 * 1024 * 1024; // 20MB
+  const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per part
+  const CONCURRENT_UPLOADS = 3;
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     e.target.value = "";
     setUploading(true);
+    setUploadProgress(0);
     setUploadError(null);
 
     try {
       console.log("Starting upload for file:", file.name, file.type, file.size);
-      
-      // Step 1: Get presigned URL from API
-      const presignRes = await fetch("/api/assets/presign", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          inspirationId: id,
-          mimeType: file.type,
-          filename: file.name,
-        }),
-      }).catch(err => {
-        console.error("Fetch error for presign:", err);
-        throw new Error(`Failed to reach presign API: ${err.message}`);
-      });
+      const totalSize = file.size;
+      let assetId: string;
+      let r2Key: string;
+      let assetType: string;
 
-      if (!presignRes.ok) {
-        const contentType = presignRes.headers.get("content-type") || "";
-        if (contentType.includes("application/json")) {
-          const err = await presignRes.json();
-          throw new Error(err.error || `Failed to get upload URL: ${presignRes.status}`);
-        } else {
-          const text = await presignRes.text();
-          throw new Error(`Server error (${presignRes.status}): ${text.substring(0, 100)}`);
+      if (totalSize <= MULTIPART_THRESHOLD) {
+        // Small file: single presigned PUT
+        const presignRes = await fetch("/api/assets/presign", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            inspirationId: id,
+            mimeType: file.type,
+            filename: file.name,
+          }),
+        });
+
+        if (!presignRes.ok) {
+          const err = await presignRes.json().catch(() => ({ error: "Presign failed" }));
+          throw new Error(err.error || `Presign failed: ${presignRes.status}`);
+        }
+
+        const presignData = await presignRes.json();
+        assetId = presignData.assetId;
+        r2Key = presignData.r2Key;
+        assetType = presignData.assetType;
+
+        // Upload with XHR for progress
+        await uploadChunkWithProgress(presignData.uploadUrl, file, (loaded) => {
+          setUploadProgress(Math.round((loaded / totalSize) * 100));
+        });
+      } else {
+        // Large file: multipart upload
+        console.log("Using multipart upload for large file");
+
+        // Step 1: Initiate multipart upload
+        const initRes = await fetch("/api/assets/multipart-init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            inspirationId: id,
+            mimeType: file.type,
+            filename: file.name,
+          }),
+        });
+
+        if (!initRes.ok) {
+          const err = await initRes.json().catch(() => ({ error: "Init failed" }));
+          throw new Error(err.error || `Multipart init failed: ${initRes.status}`);
+        }
+
+        const initData = await initRes.json();
+        assetId = initData.assetId;
+        r2Key = initData.r2Key;
+        assetType = initData.assetType;
+        const uploadId = initData.uploadId;
+
+        // Step 2: Calculate parts
+        const totalParts = Math.ceil(totalSize / CHUNK_SIZE);
+        const allPartNumbers = Array.from({ length: totalParts }, (_, i) => i + 1);
+        console.log(`File split into ${totalParts} parts of ${CHUNK_SIZE / 1024 / 1024}MB each`);
+
+        // Step 3: Get presigned URLs for all parts
+        const presignRes = await fetch("/api/assets/multipart-presign", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ r2Key, uploadId, partNumbers: allPartNumbers }),
+        });
+
+        if (!presignRes.ok) {
+          // Abort the multipart upload on failure
+          await fetch("/api/assets/multipart-complete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ r2Key, uploadId, abort: true }),
+          }).catch(() => {});
+          const err = await presignRes.json().catch(() => ({ error: "Presign failed" }));
+          throw new Error(err.error || `Part presign failed: ${presignRes.status}`);
+        }
+
+        const { urls } = await presignRes.json();
+
+        // Step 4: Upload parts with concurrency and progress tracking
+        const completedParts: { partNumber: number; etag: string }[] = [];
+        const partProgress: number[] = new Array(totalParts).fill(0);
+
+        const updateTotalProgress = () => {
+          const totalLoaded = partProgress.reduce((sum, p) => sum + p, 0);
+          setUploadProgress(Math.round((totalLoaded / totalSize) * 100));
+        };
+
+        // Process parts in batches of CONCURRENT_UPLOADS
+        for (let i = 0; i < totalParts; i += CONCURRENT_UPLOADS) {
+          const batch = allPartNumbers.slice(i, i + CONCURRENT_UPLOADS);
+          const batchResults = await Promise.all(
+            batch.map(async (partNumber) => {
+              const start = (partNumber - 1) * CHUNK_SIZE;
+              const end = Math.min(start + CHUNK_SIZE, totalSize);
+              const chunk = file.slice(start, end);
+              const partIndex = partNumber - 1;
+
+              const etag = await uploadChunkWithRetry(
+                urls[partNumber],
+                chunk,
+                (loaded) => {
+                  partProgress[partIndex] = loaded;
+                  updateTotalProgress();
+                }
+              );
+
+              // Mark this part as fully uploaded
+              partProgress[partIndex] = end - start;
+              updateTotalProgress();
+
+              return { partNumber, etag };
+            })
+          );
+
+          completedParts.push(...batchResults);
+        }
+
+        // Step 5: Complete multipart upload
+        console.log("All parts uploaded, completing multipart upload...");
+        const completeRes = await fetch("/api/assets/multipart-complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            r2Key,
+            uploadId,
+            parts: completedParts,
+          }),
+        });
+
+        if (!completeRes.ok) {
+          const err = await completeRes.json().catch(() => ({ error: "Complete failed" }));
+          throw new Error(err.error || `Multipart complete failed: ${completeRes.status}`);
         }
       }
 
-      const { assetId, r2Key, uploadUrl, assetType } = await presignRes.json();
-      console.log("Got presigned URL, starting R2 upload...");
-
-      // Step 2: Upload file directly to R2 via presigned URL
-      const uploadRes = await fetch(uploadUrl, {
-        method: "PUT",
-        headers: { "Content-Type": file.type },
-        body: file,
-      }).catch(err => {
-        console.error("Fetch error for R2 upload:", err);
-        throw new Error(`Failed to reach R2 storage: ${err.message}. Check CORS settings.`);
-      });
-
-      if (!uploadRes.ok) {
-        const errorText = await uploadRes.text().catch(() => "Unknown error");
-        throw new Error(
-          `R2 storage rejected upload: ${uploadRes.status} ${errorText.substring(0, 100)}`
-        );
-      }
+      setUploadProgress(100);
       console.log("R2 upload successful.");
 
-      // Step 3: Generate and upload thumbnail for videos
+      // Generate and upload thumbnail for videos
       let thumbnailR2Key: string | null = null;
       if (file.type.startsWith("video/")) {
         try {
@@ -267,11 +420,10 @@ export default function InspirationDetailPage() {
           }
         } catch (thumbErr) {
           console.error("Thumbnail generation failed:", thumbErr);
-          // Non-fatal: continue without thumbnail
         }
       }
 
-      // Step 4: Register asset in database
+      // Register asset in database
       const registerRes = await fetch("/api/assets/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -496,11 +648,21 @@ export default function InspirationDetailPage() {
             {uploading && (
               <div className="flex aspect-video items-center justify-center bg-zinc-900">
                 <div className="text-center">
-                  <div className="mb-3 h-1.5 w-48 overflow-hidden rounded-full bg-zinc-800">
-                    <div className="h-full animate-pulse rounded-full bg-white/60" style={{ width: "60%" }} />
+                  <div className="mb-2 text-2xl font-bold text-white">{uploadProgress}%</div>
+                  <div className="mb-3 h-2 w-64 overflow-hidden rounded-full bg-zinc-800">
+                    <div
+                      className="h-full rounded-full bg-blue-500 transition-all duration-300"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
                   </div>
-                  <span className="text-sm text-zinc-400">Uploading to storage...</span>
-                  <p className="mt-1 text-xs text-zinc-600">Large files may take a moment</p>
+                  <span className="text-sm text-zinc-400">
+                    {uploadProgress < 100 ? "Uploading to storage..." : "Finalising..."}
+                  </span>
+                  <p className="mt-1 text-xs text-zinc-600">
+                    {uploadProgress < 100
+                      ? "Do not close this page during upload"
+                      : "Almost done"}
+                  </p>
                 </div>
               </div>
             )}

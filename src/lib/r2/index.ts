@@ -3,6 +3,10 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
@@ -64,4 +68,61 @@ export async function getSignedUploadUrl(
     ContentType: contentType,
   });
   return getSignedUrl(r2, command, { expiresIn });
+}
+
+export async function createMultipartUpload(
+  key: string,
+  contentType: string
+): Promise<string> {
+  const result = await r2.send(
+    new CreateMultipartUploadCommand({
+      Bucket: BUCKET,
+      Key: key,
+      ContentType: contentType,
+    })
+  );
+  return result.UploadId!;
+}
+
+export async function getSignedPartUrl(
+  key: string,
+  uploadId: string,
+  partNumber: number,
+  expiresIn = 3600
+): Promise<string> {
+  const command = new UploadPartCommand({
+    Bucket: BUCKET,
+    Key: key,
+    UploadId: uploadId,
+    PartNumber: partNumber,
+  });
+  return getSignedUrl(r2, command, { expiresIn });
+}
+
+export async function completeMultipartUpload(
+  key: string,
+  uploadId: string,
+  parts: { PartNumber: number; ETag: string }[]
+): Promise<void> {
+  await r2.send(
+    new CompleteMultipartUploadCommand({
+      Bucket: BUCKET,
+      Key: key,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: parts },
+    })
+  );
+}
+
+export async function abortMultipartUpload(
+  key: string,
+  uploadId: string
+): Promise<void> {
+  await r2.send(
+    new AbortMultipartUploadCommand({
+      Bucket: BUCKET,
+      Key: key,
+      UploadId: uploadId,
+    })
+  );
 }
